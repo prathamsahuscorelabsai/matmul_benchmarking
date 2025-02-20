@@ -70,7 +70,8 @@ int main(int argc, char **argv) {
         
         double t0 = MPI_Wtime();
         
-        // Compute partial product: local_C = A[:, k_start:k_end] dot B[k_start:k_end, :]
+        //Is the implementation of torch matmul much more optimised than this which is causing network latency to overexceed this?
+
         for (int i = 0; i < N; i++){
             for (int k = k_start; k < k_end; k++){
                 double a_val = A[i * N + k];
@@ -107,7 +108,7 @@ int main(int argc, char **argv) {
     
     // Only rank 0 prints the CSV header and result.
     if (rank == 0) {
-        // printf("Implemendtation,CPU_Count,Matrix_Size,Iterations,t_min(s),t_max(s),t_avg(s),stddev(%%)\n");
+        printf("Implemendtation,CPU_Count,Matrix_Size,Iterations,t_min(s),t_max(s),t_avg(s),stddev(%%)\n");
         printf("MPI,%d,%d,%d,%.6f,%.6f,%.6f,%.2f\n",
                world_size, N, count, t_min, t_max, t_avg, stddev);
     }

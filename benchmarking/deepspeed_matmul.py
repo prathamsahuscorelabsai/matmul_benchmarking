@@ -19,7 +19,7 @@ import deepspeed.comm as dist
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Distributed Matrix Multiplication using DeepSpeed on CPU"
+        description="Distributed Matrix Multiplication using DeepSpeed on CPU with inner-dimension partitioning"
     )
     # Accept local_rank so that DeepSpeed launcher doesn't complain.
     parser.add_argument("--local_rank", type=int, default=0,
@@ -55,7 +55,10 @@ def main():
     device = torch.device("cpu")
     N = args.size
 
-    # Rank 0 initializes matrices; then broadcast to all ranks.
+    # For this strategy, we assume both matrices A and B are of size N x N.
+    # We'll partition the inner dimension (the shared dimension) equally.
+    # Process i will work on the chunk corresponding to columns [k_start:k_end] of A
+    # and rows [k_start:k_end] of B.
     if rank == 0:
         A = torch.rand(N, N, dtype=dtype, device=device)
         B = torch.rand(N, N, dtype=dtype, device=device)
@@ -63,12 +66,15 @@ def main():
         A = torch.empty(N, N, dtype=dtype, device=device)
         B = torch.empty(N, N, dtype=dtype, device=device)
 
+    # Broadcast both matrices A and B to all processes.
     torch.distributed.broadcast(A, src=0)
     torch.distributed.broadcast(B, src=0)
 
-    # Partition the inner (K) dimension among processes.
+    # Partition the inner dimension (of length N) among world_size processes.
+    # For example, if N=10 and world_size=2, then each process gets a chunk of size 5.
     base = N // world_size
     rem = N % world_size
+    # Distribute any remainder among the first 'rem' processes.
     k_start = rank * base + (rank if rank < rem else rem)
     k_count = base + (1 if rank < rem else 0)
     k_end = k_start + k_count
@@ -78,10 +84,12 @@ def main():
 
     for i in range(total_iterations):
         t0 = time.time()
-        # Compute partial product.
+        # Each process computes a partial product:
+        #   partial_C = A[:, k_start:k_end] dot B[k_start:k_end, :]
         local_C = torch.matmul(A[:, k_start:k_end], B[k_start:k_end, :])
+        # Copy the result to be reduced.
         final_C = local_C.clone()
-        # Allreduce so that every rank gets the complete final matrix.
+        # Allreduce (sum) the partial results across all processes.
         if args.ccl:
             dist.all_reduce(final_C)
         else:
