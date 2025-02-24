@@ -10,7 +10,15 @@ cpu_counts=(1 2 4 8)
 mpi4py_csv="mpi4py_results.csv"
 
 # Write CSV header.
-echo "Implementation,CPU_Count,Matrix_Size,Iterations,t_min(s),t_max(s),t_avg(s),stddev(%)" > "$mpi4py_csv"
+#  header = [
+#             "Implementation", "CPU_Count", "Matrix_Size", "Iterations",
+#             "Matmul_t_min(s)", "Matmul_t_max(s)", "Matmul_t_avg(s)", "Matmul_stddev(%)",
+#             "Allreduce_t_min(s)", "Allreduce_t_max(s)", "Allreduce_t_avg(s)", "Allreduce_stddev(%)",
+#             "Total_t_min(s)", "Total_t_max(s)", "Total_t_avg(s)", "Total_stddev(%)"
+#         ]
+
+echo "Implementation,CPU_Count,Matrix_Size,Iterations,Matmul_t_min(s),Matmul_t_max(s),Matmul_t_avg(s),Matmul_stddev(%),Allreduce_t_min(s),Allreduce_t_max(s),Allreduce_t_avg(s),Allreduce_stddev(%),Total_t_min(s),Total_t_max(s),Total_t_avg(s),Total_stddev(%)" > "$mpi4py_csv"
+
 
 # Temporary file for CSV output.
 temp_mpi4py="temp_mpi4py.csv"

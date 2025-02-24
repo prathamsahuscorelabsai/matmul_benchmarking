@@ -50,15 +50,14 @@ def main():
     deepspeed.init_distributed()
     rank = dist.get_rank()
     world_size = dist.get_world_size()
+    # print(f"Rank {rank}/{world_size} reporting for duty!")
+    # print(f"Rank {rank} is running on core {os.sched_getaffinity(0)}")
 
     # Use CPU explicitly.
     device = torch.device("cpu")
     N = args.size
 
     # For this strategy, we assume both matrices A and B are of size N x N.
-    # We'll partition the inner dimension (the shared dimension) equally.
-    # Process i will work on the chunk corresponding to columns [k_start:k_end] of A
-    # and rows [k_start:k_end] of B.
     if rank == 0:
         A = torch.rand(N, N, dtype=dtype, device=device)
         B = torch.rand(N, N, dtype=dtype, device=device)
@@ -70,45 +69,95 @@ def main():
     torch.distributed.broadcast(A, src=0)
     torch.distributed.broadcast(B, src=0)
 
-    # Partition the inner dimension (of length N) among world_size processes.
-    # For example, if N=10 and world_size=2, then each process gets a chunk of size 5.
+    # Partition the inner dimension among world_size processes.
     base = N // world_size
     rem = N % world_size
-    # Distribute any remainder among the first 'rem' processes.
-    k_start = rank * base + (rank if rank < rem else rem)
-    k_count = base + (1 if rank < rem else 0)
+    if rank < rem:
+        k_start = rank * (base + 1)
+        k_count = base + 1
+    else:
+        k_start = rem * (base + 1) + (rank - rem) * base
+        k_count = base
     k_end = k_start + k_count
 
-    timings = []
+    timings_matmul = []
+    timings_allreduce = []
     total_iterations = args.count + args.warmup
+    final_C = None  # to hold the last computed distributed result
+
+    # #print size of A and B
+    # print(f"Size of A: {A.size()}")
+    # print(f"Size of B: {B.size()}")
 
     for i in range(total_iterations):
+        # Measure the matmul section.
         t0 = time.time()
-        # Each process computes a partial product:
-        #   partial_C = A[:, k_start:k_end] dot B[k_start:k_end, :]
         local_C = torch.matmul(A[:, k_start:k_end], B[k_start:k_end, :])
-        # Copy the result to be reduced.
+        t1 = time.time()
+        #print rank and size of local_C
+        # print(f"Rank {rank} size of local_C: {local_C.size()} and k_start: {k_start} k_end: {k_end}")
+        # Copy the result for allreduce.
         final_C = local_C.clone()
-        # Allreduce (sum) the partial results across all processes.
+        # Measure the all_reduce section.
+        t2 = time.time()
         if args.ccl:
             dist.all_reduce(final_C)
         else:
-            dist.inference_all_reduce(final_C)
-        t1 = time.time()
+            dist.inference_all_reduce(final_C)  # own implementation
+        t3 = time.time()
+
+        # Only record timings after warmup iterations.
         if i >= args.warmup:
-            timings.append(t1 - t0)
+            timings_matmul.append(t1 - t0)
+            timings_allreduce.append(t3 - t2)
 
-    # Compute statistics.
-    t_min = min(timings)
-    t_max = max(timings)
-    t_avg = sum(timings) / len(timings)
-    variance = sum((t - t_avg) ** 2 for t in timings) / len(timings)
-    stddev = math.sqrt(variance) / t_avg * 100 if t_avg != 0 else 0
+    # Compute statistics for matmul timing.
+    matmul_t_min = min(timings_matmul)
+    matmul_t_max = max(timings_matmul)
+    matmul_t_avg = sum(timings_matmul) / len(timings_matmul)
+    var_matmul = sum((t - matmul_t_avg) ** 2 for t in timings_matmul) / len(timings_matmul)
+    stddev_matmul = math.sqrt(var_matmul) / matmul_t_avg * 100 if matmul_t_avg != 0 else 0
 
-    # Only rank 0 writes the CSV header and results.
+    # Compute statistics for all_reduce timing.
+    allreduce_t_min = min(timings_allreduce)
+    allreduce_t_max = max(timings_allreduce)
+    allreduce_t_avg = sum(timings_allreduce) / len(timings_allreduce)
+    var_allreduce = sum((t - allreduce_t_avg) ** 2 for t in timings_allreduce) / len(timings_allreduce)
+    stddev_allreduce = math.sqrt(var_allreduce) / allreduce_t_avg * 100 if allreduce_t_avg != 0 else 0
+
+    # Compute total time per iteration (matmul + allreduce).
+    total_times = [m + a for m, a in zip(timings_matmul, timings_allreduce)]
+    total_t_min = min(total_times)
+    total_t_max = max(total_times)
+    total_t_avg = sum(total_times) / len(total_times)
+    var_total = sum((t - total_t_avg) ** 2 for t in total_times) / len(total_times)
+    stddev_total = math.sqrt(var_total) / total_t_avg * 100 if total_t_avg != 0 else 0
+
+    # On rank 0, check the validity of the distributed result by comparing with single-core computation.
     if rank == 0:
-        header = ["Implementation", "CPU_Count", "Matrix_Size", "Iterations", "t_min(s)", "t_max(s)", "t_avg(s)", "stddev(%)"]
-        row = ["DeepSpeed", world_size, N, args.count, f"{t_min:.6f}", f"{t_max:.6f}", f"{t_avg:.6f}", f"{stddev:.2f}"]
+        C_single = torch.matmul(A, B)
+        if not torch.allclose(final_C, C_single, rtol=1e-3, atol=1e-5):
+            print("Result check FAILED: Distributed result does not match single-core matmul result!")
+            return
+        else:
+            print("Result check passed: Distributed result matches single-core matmul result.")
+
+        # Print total time metrics.
+        print(f"Total time metrics: min={total_t_min:.6f}s, max={total_t_max:.6f}s, avg={total_t_avg:.6f}s, stddev={stddev_total:.2f}%")
+
+        # Write results to CSV with separate timing columns.
+        header = [
+            "Implementation", "CPU_Count", "Matrix_Size", "Iterations",
+            "Matmul_t_min(s)", "Matmul_t_max(s)", "Matmul_t_avg(s)", "Matmul_stddev(%)",
+            "Allreduce_t_min(s)", "Allreduce_t_max(s)", "Allreduce_t_avg(s)", "Allreduce_stddev(%)",
+            "Total_t_min(s)", "Total_t_max(s)", "Total_t_avg(s)", "Total_stddev(%)"
+        ]
+        row = [
+            "DeepSpeed", world_size, N, args.count,
+            f"{matmul_t_min:.6f}", f"{matmul_t_max:.6f}", f"{matmul_t_avg:.6f}", f"{stddev_matmul:.2f}",
+            f"{allreduce_t_min:.6f}", f"{allreduce_t_max:.6f}", f"{allreduce_t_avg:.6f}", f"{stddev_allreduce:.2f}",
+            f"{total_t_min:.6f}", f"{total_t_max:.6f}", f"{total_t_avg:.6f}", f"{stddev_total:.2f}"
+        ]
         with open(args.outfile, "w", newline="") as csvfile:
             writer = csv.writer(csvfile)
             writer.writerow(header)
